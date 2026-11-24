@@ -58,7 +58,7 @@ export function salvage(reply: string, previous = ""): string {
   return [lines.join("\n").trimEnd(), ...missing].join("\n\n")
 }
 
-// pi >= 1.5 ignores reserveTokens and caps the output at model.maxTokens, so the cap is set on the model.
+// pi >= 1.4 ignores reserveTokens and caps the output at model.maxTokens, so the cap is set on the model.
 // A normal summary is ~8k tokens; the cap only bounds how long a repeating reply runs (~3 min).
 const MAX_SUMMARY_TOKENS = 16_384
 // 120k characters measured ~30-40k tokens on this model, i.e. ~3-4 characters per token; 3 is the
