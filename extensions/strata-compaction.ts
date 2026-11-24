@@ -76,6 +76,11 @@ const MIN_CHUNK_CHARS = 8_000
 // characters, close to the 120k that was measured safe on this model.
 const MARGIN = 0.5
 
+// Which model to summarise with. Unset means the first chat model the local Strata provider serves, not
+// a model named strata; anyone whose model sits under another provider, or who has several configured
+// under strata, sets STRATA_COMPACT_MODEL="provider/id" in the environment.
+const MODEL_REF = process.env.STRATA_COMPACT_MODEL || ""
+
 function chunkSize(model: { contextWindow: number }): number {
   // STRATA_COMPACT_CHUNK_CHARS wins over the computed size when it is set.
   const override = Number(process.env.STRATA_COMPACT_CHUNK_CHARS)
@@ -106,8 +111,16 @@ function chunk(messages: Messages, chunkChars: number): Messages[] {
 export default function (pi: ExtensionAPI) {
   pi.on("session_before_compact", async (event, ctx) => {
     const { preparation, signal, customInstructions } = event
-    const model = ctx.modelRegistry.find("strata", "strata")
-    if (!model) return
+    // A model id may itself contain "/", so only the first one splits the reference.
+    const [provider, ...idParts] = MODEL_REF.split("/")
+    const model = MODEL_REF
+      ? ctx.modelRegistry.find(provider, idParts.join("/"))
+      : ctx.modelRegistry.getModelsOfType("chat", "strata")[0]
+    if (!model) {
+      const wanted = MODEL_REF ? `model "${MODEL_REF}"` : `chat model from the "strata" provider`
+      ctx.ui.notify(`Strata compaction: no ${wanted} in the registry; using the default`, "warning")
+      return
+    }
     const strata = { ...model, maxTokens: MAX_SUMMARY_TOKENS }
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model)
     if (!auth.ok) return

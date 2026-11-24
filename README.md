@@ -30,7 +30,7 @@ pi install ./pi-strata-compaction
 
 ## Requirements
 
-- A Strata server running locally, and a provider named `strata` with a model id `strata` in pi's `models.json` (the extension looks up exactly `strata/strata`). If that lookup fails, the extension does nothing. The model's `contextWindow` in `models.json` is what the chunking is sized from; a small value produces small chunks.
+- A Strata server running locally, and a provider named `strata` in pi's `models.json`: the extension uses the model that provider serves, whatever its id is. `STRATA_COMPACT_MODEL="provider/id"` picks another provider, or one specific model when several are configured. If the lookup fails the extension does nothing and pi uses its default compaction. The model's `contextWindow` in `models.json` is what the chunking is sized from; a small value produces small chunks.
 - pi 1.5 or newer: pi 1.5 ignores `reserveTokens` and caps output at `model.maxTokens`, so the extension sets that cap on a copy of the model itself.
 
 ## What it does
@@ -52,6 +52,7 @@ Progress is reported as `Strata compaction: part 1/3`.
 | Chunk size | computed from the model's `contextWindow` in `models.json`; `STRATA_COMPACT_CHUNK_CHARS` env var overrides it | Default is `(contextWindow - MAX_SUMMARY_TOKENS - SUMMARY_TOKENS) * 3 * 0.5` characters, floored at `8_000`: the chunk must share the window with the previous summary, the prompt and the reply, and the half is the safety margin for a rough estimate. 120k characters measured ~30-40k tokens on this model, hence 3 characters per token; for a 100k-token window the default is ~113k characters. |
 | Section budget | `SECTION_CHARS` in the source, default `3_000` | Bounds the summary Strata copies into each fold. At 6k per section the copy filled the 16k token cap and the next fold ran out. |
 | Output cap | `MAX_SUMMARY_TOKENS` in the source, default `16_384` | A normal summary is ~8k tokens; this only bounds how long a repeating reply runs. |
+| Summarising model | `STRATA_COMPACT_MODEL` env var, default: the first chat model of the `strata` provider | Format `provider/id`; only the first `/` splits, so a model id may contain one. Unset, any id served by the `strata` provider works. Set it for another provider, or to choose one model when several are configured; its `contextWindow` is what the chunking is sized from. If the lookup fails the extension does nothing and pi uses its default compaction. |
 
 Reasoning is set to `minimal`, which maps to Strata's `none`, so the whole token cap goes to the summary.
 
