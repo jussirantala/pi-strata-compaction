@@ -6,7 +6,7 @@
 // pi fall back to its default compaction.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { convertToLlm, generateSummaryWithUsage, serializeConversation } from "@earendil-works/pi-coding-agent"
-import { contentText, streamSimple } from "@earendil-works/pi-ai/compat"
+import { contentText } from "@earendil-works/pi-ai/compat"
 
 // Strata ignores length instructions (asked for 3,000 words, it rewrote a 42k-token summary until the 16k cap),
 // so the previous summary is trimmed here. Appended sections keep their newest lines; Goal and Next Steps,
@@ -61,18 +61,18 @@ export function salvage(reply: string, previous = ""): string {
 // pi >= 1.5 ignores reserveTokens and caps the output at model.maxTokens, so the cap is set on the model.
 // A normal summary is ~8k tokens; the cap only bounds how long a repeating reply runs (~3 min).
 const MAX_SUMMARY_TOKENS = 16_384
-// What has to fit in the context window next to the chunk: the previous summary, bounded here at
-// SECTION_CHARS per section, plus pi's update prompt. A normal summary is ~8k tokens.
-const SUMMARY_TOKENS = 8_192
 // 120k characters measured ~30-40k tokens on this model, i.e. ~3-4 characters per token; 3 is the
 // conservative side of that range.
 const CHARS_PER_TOKEN = 3
+// What has to fit in the context window next to the chunk: the previous summary plus pi's update prompt.
+// pi's summary format has 9 sections, each trimmed to ~SECTION_CHARS, plus ~1k tokens for pi's prompt.
+const SUMMARY_TOKENS = Math.ceil((9 * SECTION_CHARS) / CHARS_PER_TOKEN) + 1_024
 // A context window small enough to leave nothing after the summary and prompt would give a zero or
 // negative chunk; this is the floor it falls back to.
 const MIN_CHUNK_CHARS = 8_000
 
 // The estimate is rough, and a chunk that overflows costs a failed round trip plus the half-split
-// retry below, so only half the remaining window is used. For a 100k-token window that is ~113k
+// retry below, so only half the remaining window is used. For a 100k-token window that is ~110k
 // characters, close to the 120k that was measured safe on this model.
 const MARGIN = 0.5
 
@@ -82,9 +82,10 @@ const MARGIN = 0.5
 const MODEL_REF = process.env.STRATA_COMPACT_MODEL || ""
 
 function chunkSize(model: { contextWindow: number }): number {
-  // STRATA_COMPACT_CHUNK_CHARS wins over the computed size when it is set.
+  // STRATA_COMPACT_CHUNK_CHARS wins over the computed size, but only as a positive number; NaN, 0 and
+  // negatives fall back to it, and a small value is still held to the floor below.
   const override = Number(process.env.STRATA_COMPACT_CHUNK_CHARS)
-  if (override) return override
+  if (override > 0) return Math.max(override, MIN_CHUNK_CHARS)
   return Math.max(MIN_CHUNK_CHARS, Math.floor((model.contextWindow - MAX_SUMMARY_TOKENS - SUMMARY_TOKENS) * CHARS_PER_TOKEN * MARGIN))
 }
 
@@ -123,30 +124,40 @@ export default function (pi: ExtensionAPI) {
     }
     const strata = { ...model, maxTokens: MAX_SUMMARY_TOKENS }
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model)
-    if (!auth.ok) return
+    if (!auth.ok) {
+      ctx.ui.notify(`Strata compaction: no credentials for ${model.provider}/${model.id} (${auth.error}); using the default`, "warning")
+      return
+    }
 
     const summarise = async (messages: Messages, previous: string | undefined, split = false): Promise<string> => {
       // pi throws away a reply that hit the token cap, so its stream is kept here to read it afterwards.
-      let reply: ReturnType<ReturnType<typeof streamSimple>["result"]> | undefined
+      let reply: ReturnType<ReturnType<typeof ctx.modelRegistry.streamSimple>["result"]> | undefined
       try {
         // "minimal" maps to Strata's "none": no thinking, so the whole token cap goes to the summary.
         const result = await generateSummaryWithUsage(
           messages, strata, MAX_SUMMARY_TOKENS, auth.apiKey, auth.headers, signal, customInstructions,
           previous && trimSummary(previous),
           "minimal",
-          (...args: Parameters<typeof streamSimple>) => {
-            const stream = streamSimple(...args)
+          // The compat streamSimple cannot see providers registered by extensions; the registry one can.
+          (...args: Parameters<typeof ctx.modelRegistry.streamSimple>) => {
+            const stream = ctx.modelRegistry.streamSimple(...args)
             reply = stream.result()
             return stream
           },
           auth.env,
         )
+        // An empty summary would make the next fold use the fresh-summary prompt and silently drop all earlier history.
+        if (!result.text.trim()) throw new Error("Strata returned an empty summary")
         return result.text
       } catch (error) {
         const cut = await reply
         if (cut?.stopReason === "length" && contentText(cut.content).trim()) {
-          ctx.ui.notify("Strata compaction: the reply hit the token cap; kept it up to there", "warning")
-          return salvage(contentText(cut.content), previous)
+          const kept = salvage(contentText(cut.content), previous)
+          // An empty salvage would drop the history the next fold relies on, so retry the chunk instead.
+          if (kept.trim()) {
+            ctx.ui.notify("Strata compaction: the reply hit the token cap; kept it up to there", "warning")
+            return kept
+          }
         }
         // A chunk Strata could not finish is retried once as two halves; splitting further would repeat
         // the same failing full-length rewrite for hours.
@@ -160,19 +171,24 @@ export default function (pi: ExtensionAPI) {
       const chunks = chunk([...preparation.messagesToSummarize, ...preparation.turnPrefixMessages], chunkSize(model))
       let summary = preparation.previousSummary
       for (const [index, messages] of chunks.entries()) {
+        signal.throwIfAborted()
         ctx.ui.notify(`Strata compaction: part ${index + 1}/${chunks.length}`, "info")
         summary = await summarise(messages, summary)
       }
-      if (!summary?.trim()) return
+      if (!summary?.trim()) {
+        ctx.ui.notify("Strata compaction: empty summary; using the default", "warning")
+        return
+      }
 
       const { fileOps } = preparation
       // pi leaves out the file lists of an extension's compaction (fromHook), so carry the last ones forward.
+      // details is writable by any extension, so only an actual list is carried over.
       const last = event.branchEntries.findLast((entry) => entry.type === "compaction")?.details as
         { readFiles?: string[]; modifiedFiles?: string[] } | undefined
       const modifiedFiles = [
-        ...new Set([...fileOps.edited, ...fileOps.written, ...(last?.modifiedFiles ?? [])]),
+        ...new Set([...fileOps.edited, ...fileOps.written, ...(last && Array.isArray(last.modifiedFiles) ? last.modifiedFiles : [])]),
       ].sort()
-      const readFiles = [...new Set([...fileOps.read, ...(last?.readFiles ?? [])])]
+      const readFiles = [...new Set([...fileOps.read, ...(last && Array.isArray(last.readFiles) ? last.readFiles : [])])]
         .filter((file) => !modifiedFiles.includes(file))
         .sort()
       const sections = [
