@@ -1,0 +1,13 @@
+{
+  "name": "pi-strata-compaction",
+  "version": "1.0.0",
+  "description": "Pi extension that writes session compaction summaries with a local Strata model instead of the session model",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions/strata-compaction.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
